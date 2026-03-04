@@ -74,13 +74,28 @@ def main():
     with open(prompt_path, 'r') as f:
         commit_msg_instructions = f.read()
 
+    # Run git from the repo being committed (where the hook was invoked), not from cwd.
+    try:
+        rev_parse = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+        repo_root = rev_parse.stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        sys.stderr.write('prepare-commit-msg: failed to get repo root: {}\n'.format(e))
+        sys.exit(1)
+
     try:
         diff_output = subprocess.run(
-            ['git', 'diff', '--cached'],
+            ['git', 'diff', '--cached', '--no-color'],
             capture_output=True,
             text=True,
             check=True,
             timeout=10,
+            cwd=repo_root,
         )
         diff_text = diff_output.stdout or '(no staged changes)'
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
