@@ -1,4 +1,1 @@
-# Name 
-Commit Message Helper
-# Description
-Given the following git diff, write a brief but descriptive commit message. 50 is the maximum number of characters of the commit title, and 72 is the maximum character length of the commit body.
+Given the following git diff, write a 50 character or less commit message. You can optionally add additionaly 72 character commit body. Output only one commit message for the staged diff, not a log or history.
