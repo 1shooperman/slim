@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+prepare-commit-msg: Git hook that asks Ollama for a commit message from the staged diff.
+
+Requires:
+  - SLM_ROOT (env) or git config --global slm.root: path to the slm repo (contains prompts/COMMIT_MSG.md)
+  - Ollama container running (see README)
+  - Python 3
+
+Only runs when the user runs `git commit` without -m (source is "commit").
+When source is "message", the user passed -m; hook exits without changing the file.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+# Defaults; override via env
+OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
+OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'phi3:mini')
+MAX_DIFF_BYTES = 32 * 1024  # 32 KiB to avoid huge prompts
+
+MESSAGE_TEMPLATE = """# Subject line (try to keep under 50 characters)
+[{}]
+
+# Multi-line description of commit,
+# feel free to be detailed.
+# [See Also: X]
+"""
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write('prepare-commit-msg: missing commit message file path\n')
+        sys.exit(1)
+
+    msg_file = sys.argv[1]
+    source = sys.argv[2] if len(sys.argv) > 2 else 'commit'
+
+    # Only pre-fill when user will see the editor (normal `git commit` without -m)
+    if source != 'commit':
+        sys.exit(0)
+
+    slm_root = os.environ.get('SLM_ROOT')
+    if not slm_root:
+        try:
+            result = subprocess.run(
+                ['git', 'config', '--global', '--get', 'slm.root'],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout:
+                slm_root = result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    if not slm_root:
+        sys.stderr.write(
+            'prepare-commit-msg: SLM_ROOT is not set and git config --global slm.root is not set. '
+            'Set one of them to the path of the slm repo. See README.\n'
+        )
+        sys.exit(1)
+
+    prompt_path = os.path.join(slm_root, 'prompts', 'COMMIT_MSG.md')
+    if not os.path.isfile(prompt_path):
+        sys.stderr.write(
+            'prepare-commit-msg: prompt file not found: {}\n'.format(prompt_path)
+        )
+        sys.exit(1)
+
+    with open(prompt_path, 'r') as f:
+        commit_msg_instructions = f.read()
+
+    try:
+        diff_output = subprocess.run(
+            ['git', 'diff', '--cached'],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        diff_text = diff_output.stdout or '(no staged changes)'
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        sys.stderr.write('prepare-commit-msg: failed to get git diff: {}\n'.format(e))
+        sys.exit(1)
+
+    if len(diff_text.encode('utf-8')) > MAX_DIFF_BYTES:
+        diff_text = diff_text[:MAX_DIFF_BYTES] + '\n\n... (diff truncated)\n'
+
+    prompt = build_prompt(commit_msg_instructions, diff_text)
+    response_text, failure_reason = call_ollama(prompt)
+
+    if response_text is None:
+        fallback = MESSAGE_TEMPLATE.format('(paste diff or summary here)')
+        with open(msg_file, 'w') as f:
+            f.write(fallback)
+        if failure_reason == 'timeout':
+            sys.stderr.write(
+                'prepare-commit-msg: Ollama did not respond in time. Wrote template.\n'
+            )
+        else:
+            sys.stderr.write(
+                'prepare-commit-msg: Ollama unreachable at {}. Wrote template. Is the container running?\n'.format(
+                    OLLAMA_HOST
+                )
+            )
+        sys.exit(0)
+
+    with open(msg_file, 'w') as f:
+        f.write(response_text)
+
+
+def build_prompt(instructions, diff_text):
+    """Build the full prompt: instructions + template description + diff."""
+    return '''{instructions}
+
+Output only a single block of text that can be used as the commit message, using this structure. Put a one-line summary or the most relevant part of the diff where indicated.
+
+# Subject line (try to keep under 50 characters)
+[one-line summary or key change]
+
+# Multi-line description of commit,
+# feel free to be detailed.
+# [See Also: X]
+
+Staged diff to base the message on:
+
+{diff}
+'''.format(instructions=instructions.strip(), diff=diff_text)
+
+
+def call_ollama(prompt):
+    """POST to Ollama /api/generate. Returns (response_text, None) on success, (None, reason) on failure.
+    reason is 'timeout' or 'unreachable' or 'invalid_response'.
+    """
+    url = OLLAMA_HOST.rstrip('/') + '/api/generate'
+    body = json.dumps({
+        'model': OLLAMA_MODEL,
+        'prompt': prompt,
+        'stream': False,
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            return (data.get('response', '').strip(), None)
+    except TimeoutError as e:
+        sys.stderr.write('prepare-commit-msg: Ollama request timed out: {}\n'.format(e))
+        return (None, 'timeout')
+    except urllib.error.URLError as e:
+        sys.stderr.write('prepare-commit-msg: Ollama request failed: {}\n'.format(e))
+        return (None, 'unreachable')
+    except (json.JSONDecodeError, KeyError) as e:
+        sys.stderr.write('prepare-commit-msg: invalid Ollama response: {}\n'.format(e))
+        return (None, 'invalid_response')
+
+
+if __name__ == '__main__':
+    main()
